@@ -24,7 +24,7 @@ testing. Raven wraps standard, widely-used tools (`whois`, `dig`,
 ## Install
 
 ```bash
-git clone https://github.com/<your-username>/raven.git
+git clone https://github.com/z7-codes/raven.git
 cd raven
 sudo ./install.sh
 ```
