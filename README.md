@@ -1,21 +1,35 @@
 # Raven
 
-Lightweight recon & assessment orchestrator for authorized security
-testing. Raven wraps standard, widely-used tools (`whois`, `dig`,
-`subfinder`, `amass`, `httpx`, `whatweb`, `nmap`, `masscan`, `nikto`,
-`nuclei`, `tshark`) behind one consistent menu, with:
+Recon & assessment orchestrator for authorized security testing.
+Raven wraps standard, widely-used tools (`whois`, `dig`, `subfinder`,
+`amass`, `httpx`, `whatweb`, `nmap`, `masscan`, `nikto`, `nuclei`,
+`tshark`) behind one consistent, Metasploit-style terminal menu.
 
-- Branded, filtered console output — raw tool output goes to
-  `raven.log` and per-target result files; the screen shows phase
-  names, timing, and a short "Key Findings" summary.
-- Scope tracking (`scope.txt`) with an explicit confirmation prompt
-  before testing anything not listed.
-- Rough per-phase time estimates based on target latency and which
-  tools are installed.
-- Safe Ctrl+C handling — an interrupted step saves whatever partial
-  output exists and returns you to the menu instead of crashing.
-- An HTML assessment report (`raven_report_<target>.html`) with
-  severity-colored alerts aggregated across every phase you ran.
+- **Grouped main menu** — Recon / Scanning / Reporting / System
+  sections, with a dependency summary (`N/19 tools ready`) always
+  visible at the top.
+- **Parallel execution** — independent tools within Passive Recon,
+  Active Recon and Vulnerability Scan run concurrently (not one at a
+  time), each with its own timing shown after it finishes.
+- **Validated target input** — only well-formed hostnames/IPs are
+  accepted; anything else (quotes, shell metacharacters, stray
+  punctuation) is rejected before it ever touches a command.
+- **Anchored scope matching** — `scope.txt` entries match the exact
+  domain or its real subdomains only; a lookalike like
+  `example.com.evil.net` is correctly flagged as out of scope.
+- **Resume/skip per phase** — Raven remembers which phases already
+  ran for the current target and asks before re-running one.
+- **Safe Ctrl+C handling** — an interrupted step saves whatever
+  partial output exists, then asks if you want to set a new target
+  right away instead of just dumping you back at the menu.
+- **Rough per-phase ETAs** based on target latency and installed
+  tools, plus a live alert-count dashboard in the banner.
+- **Reports in three formats** — HTML (`raven_report_<target>.html`),
+  CSV and JSON, all built from the same alert data collected across
+  every phase you ran.
+- **`raven.conf`** lets you tune nmap ports/timing, nuclei severity
+  filters, masscan rate, DNS record types, etc. without editing the
+  script. `--no-color` / `NO_COLOR=1` disable ANSI colors.
 
 **Author:** z7
 
@@ -24,7 +38,7 @@ testing. Raven wraps standard, widely-used tools (`whois`, `dig`,
 ## Install
 
 ```bash
-git clone https://github.com/z7-codes/raven.git
+git clone https://github.com/<your-username>/raven.git
 cd raven
 sudo ./install.sh
 ```

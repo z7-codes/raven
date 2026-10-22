@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="0.4.0"
+VERSION="0.5.0"
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RESULTS_DIR="${BASE_DIR}/results"
 SCOPE_FILE="${BASE_DIR}/scope.txt"
@@ -20,9 +20,23 @@ CONFIG_FILE="${BASE_DIR}/raven.conf"
 mkdir -p "$RESULTS_DIR" "$PLUGIN_DIR"
 touch "$SCOPE_FILE" "$LOG_FILE"
 
-# ---------- colors ----------
-C_RESET="\e[0m"; C_RED="\e[91m"; C_GREEN="\e[92m"; C_YELLOW="\e[93m"
-C_BLUE="\e[94m"; C_MAGENTA="\e[95m"; C_CYAN="\e[96m"; C_BOLD="\e[1m"; C_DIM="\e[2m"
+have()  { command -v "$1" >/dev/null 2>&1; }
+
+# ---------- dependency map (used by lib/ui.sh's dep summary too) ----------
+declare -A TOOLS=(
+    [whois]="Passive"       [dig]="Passive"        [host]="Passive"
+    [nslookup]="Passive"    [dnsrecon]="Passive"    [subfinder]="Passive"
+    [amass]="Passive/Active" [recon-ng]="Passive"   [spiderfoot]="Passive"
+    [httpx]="Active"        [whatweb]="Active"
+    [nmap]="Deep Scan"      [masscan]="Deep Scan"   [python3]="Deep Scan (scapy)"
+    [nikto]="Vuln Scan"     [nuclei]="Vuln Scan"    [gvm-cli]="Vuln Scan (GVM)"
+    [tshark]="Packet Capture" [tmux]="Full Auto"
+)
+
+# ---------- UI layer (colors, banner, menu) ----------
+# shellcheck source=lib/ui.sh
+source "${BASE_DIR}/lib/ui.sh" "$@"
+ui_refresh_dep_summary   # fast: command -v only, done once at startup
 
 # ---------- logging (detailed, goes ONLY to file) ----------
 log()   { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG_FILE"; }
@@ -36,17 +50,17 @@ phase() { echo -e "${C_MAGENTA}${C_BOLD}[RAVEN]${C_RESET} $*"; }
 find_() { echo -e "${C_BLUE}  ->${C_RESET} $*"; }
 
 pause() { echo; read -rp "$(echo -e "${C_DIM}Press ENTER to continue...${C_RESET}")" _; }
-have()  { command -v "$1" >/dev/null 2>&1; }
 
 human_time() {
     local s=$1
     if [ "$s" -ge 60 ]; then printf "%dm %ds" $((s/60)) $((s%60)); else printf "%ds" "$s"; fi
 }
 
+banner() { ui_banner; }
+
 # ============================================================
 #  CONFIG — raven.conf lets you tune the underlying tools
-#  without touching this script. Created with defaults on
-#  first run; edit it and re-run to apply your own values.
+#  without touching this script.
 # ============================================================
 load_config() {
     NMAP_PORTS_OPT="--top-ports 1000"
@@ -94,7 +108,13 @@ on_interrupt() {
     warn "Partial output (if any) has been kept under: ${TARGET_DIR:-$RESULTS_DIR}"
     log "INTERRUPTED during: ${CURRENT_STEP_LABEL:-unknown}"
     echo
-    read -rp "$(echo -e "${C_DIM}Press ENTER to return to the main menu...${C_RESET}")" _
+    read -rp "$(echo -e "${C_DIM}Set a new target now? [y/N]:${C_RESET} ")" newt
+    if [[ "$newt" =~ ^[Yy]$ ]]; then
+        INTERRUPTED=0
+        target_selection
+    else
+        read -rp "$(echo -e "${C_DIM}Press ENTER to return to the main menu...${C_RESET}")" _
+    fi
 }
 trap on_interrupt INT TERM
 
@@ -128,9 +148,7 @@ run_step() {
 
 # ============================================================
 #  PARALLEL JOB RUNNER — independent tools in one phase run
-#  concurrently instead of one-after-another. Each job's real
-#  command + output still goes to raven.log; the console only
-#  shows a spinner, then each job's done/warn line with timing.
+#  concurrently instead of one-after-another.
 # ============================================================
 JOB_LABELS=(); JOB_CMDS=(); JOB_OUTS=()
 add_job() { JOB_LABELS+=("$1"); JOB_CMDS+=("$2"); JOB_OUTS+=("$3"); }
@@ -159,9 +177,14 @@ run_jobs_parallel() {
         pids+=($!)
         log "CMD(parallel): ${JOB_CMDS[$i]}"
         running=$((running + 1))
-        # simple concurrency cap so we don't fork-bomb slow links
+        # Concurrency cap: count LIVE jobs directly rather than trusting
+        # wait -n's exit status (a failed tool's non-zero exit used to
+        # break this loop early and silently stop enforcing the cap).
         while [ "$running" -ge "$cap" ]; do
-            wait -n 2>/dev/null && running=$((running - 1)) || break
+            local alive_now=0 p
+            for p in "${pids[@]}"; do kill -0 "$p" 2>/dev/null && alive_now=$((alive_now + 1)); done
+            running=$alive_now
+            [ "$running" -ge "$cap" ] && sleep 0.2
         done
     done
     ACTIVE_PIDS=("${pids[@]}")
@@ -213,9 +236,6 @@ probe_latency_ms() {
     echo "$ms"
 }
 
-# weight = rough baseline seconds per tool on a fast link; scaled by latency factor.
-# Parallel phases show the single SLOWEST tool's time (they run concurrently),
-# not the sum — that's the real expected wall-clock time.
 estimate_phase_seconds() {
     local phase_name="$1" lat_ms="$2"
     local factor=1
@@ -261,8 +281,7 @@ show_eta() {
 }
 
 # ============================================================
-#  RESUME / SKIP — remembers which phases already ran for the
-#  current target so you don't accidentally redo a slow scan.
+#  RESUME / SKIP
 # ============================================================
 state_file() { echo "${TARGET_DIR}/.state"; }
 
@@ -275,7 +294,6 @@ mark_phase_done() {
     echo "$1=$(date '+%Y-%m-%d %H:%M:%S')" >> "$(state_file)"
 }
 
-# Returns 0 = proceed, 1 = user chose to skip
 confirm_rerun() {
     local key="$1" label="$2"
     local prev; prev=$(phase_completed_at "$key")
@@ -287,16 +305,43 @@ confirm_rerun() {
     return 0
 }
 
-# ---------- target / session / scope ----------
+# ============================================================
+#  TARGET / SESSION / SCOPE
+# ============================================================
 TARGET=""; TARGET_DIR=""
 
 load_session() { [ -f "$SESSION_FILE" ] && TARGET=$(cat "$SESSION_FILE"); [ -n "$TARGET" ] && TARGET_DIR="${RESULTS_DIR}/${TARGET}"; }
 save_session()  { echo "$TARGET" > "$SESSION_FILE"; }
 
-in_scope() {
+# Accepts a bare hostname/domain (letters, digits, dot, hyphen, optional
+# leading wildcard "*.") or a plain IPv4/IPv6 address. Rejects anything
+# containing shell metacharacters, quotes, spaces, etc. This is what
+# keeps $TARGET safe to interpolate into the eval'd tool commands below —
+# a target like "x'; rm -rf ~; echo '" is refused here, not escaped later.
+is_valid_target() {
     local t="$1"
+    [[ "$t" =~ ^(\*\.)?[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]] && return 0
+    [[ "$t" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && return 0
+    [[ "$t" =~ ^[0-9A-Fa-f:]+$ ]] && [[ "$t" == *:* ]] && return 0
+    return 1
+}
+
+# Anchored scope check: an entry "example.com" matches "example.com" and
+# "*.example.com" / "sub.example.com", but NOT "example.com.evil.net".
+# A wildcard entry "*.example.com" matches any subdomain, not the apex.
+in_scope() {
+    local t="$1" entry
     [ ! -s "$SCOPE_FILE" ] && return 1
-    grep -qiF "$t" "$SCOPE_FILE" && return 0
+    while IFS= read -r entry; do
+        entry="${entry%%$'\r'}"
+        [ -z "$entry" ] && continue
+        if [[ "$entry" == \*.* ]]; then
+            local base="${entry#\*.}"
+            [[ "$t" == "$base" || "$t" == *".$base" ]] && return 0
+        else
+            [[ "$t" == "$entry" || "$t" == *".$entry" ]] && return 0
+        fi
+    done < "$SCOPE_FILE"
     return 1
 }
 
@@ -310,10 +355,20 @@ target_selection() {
     fi
     echo
     read -rp "Add a domain to scope? (blank to skip): " ns
-    [ -n "$ns" ] && { echo "$ns" >> "$SCOPE_FILE"; ok "Added '$ns' to scope."; }
+    if [ -n "$ns" ]; then
+        if is_valid_target "$ns"; then
+            echo "$ns" >> "$SCOPE_FILE"; ok "Added '$ns' to scope."
+        else
+            err "'$ns' doesn't look like a valid domain/IP — not added."
+        fi
+    fi
     echo
     read -rp "Enter target domain to work on: " t
     [ -z "$t" ] && { warn "No target entered."; pause; return; }
+    if ! is_valid_target "$t"; then
+        err "'$t' contains characters that aren't valid in a domain/IP (letters, digits, dots, hyphens only). Aborted for safety."
+        pause; return
+    fi
     if ! in_scope "$t"; then
         warn "'$t' is NOT listed in scope.txt."
         read -rp "Proceed anyway, only if authorization is verified elsewhere [y/N]: " conf
@@ -329,17 +384,6 @@ target_selection() {
 
 require_target() { [ -z "$TARGET" ] && { err "No target selected (menu option 1 first)."; pause; return 1; }; return 0; }
 
-# ---------- dependency map ----------
-declare -A TOOLS=(
-    [whois]="Passive"       [dig]="Passive"        [host]="Passive"
-    [nslookup]="Passive"    [dnsrecon]="Passive"    [subfinder]="Passive"
-    [amass]="Passive/Active" [recon-ng]="Passive"   [spiderfoot]="Passive"
-    [httpx]="Active"        [whatweb]="Active"
-    [nmap]="Deep Scan"      [masscan]="Deep Scan"   [python3]="Deep Scan (scapy)"
-    [nikto]="Vuln Scan"     [nuclei]="Vuln Scan"    [gvm-cli]="Vuln Scan (GVM)"
-    [tshark]="Packet Capture" [tmux]="Full Auto"
-)
-
 check_dependencies() {
     clear; banner
     echo -e "${C_BOLD}── Dependency Check ──${C_RESET}\n"
@@ -352,6 +396,7 @@ check_dependencies() {
             missing+=("$tool")
         fi
     done
+    ui_refresh_dep_summary
     echo
     [ ${#missing[@]} -eq 0 ] && ok "All tools ready." || warn "Missing: ${missing[*]} (that step auto-skips and logs it). Run install.sh to fetch them."
     pause
@@ -360,12 +405,8 @@ check_dependencies() {
 # ============================================================
 #  REPORT ENGINE (ZAP-style alerts: HTML + CSV + JSON)
 # ============================================================
-# alerts.db: internal pipe-delimited store, one line per alert:
-#   severity|phase|title|detail
-# Initialized ONCE per target (target_selection), every phase
-# APPENDS to it — earlier phases' alerts are never wiped.
 ALERTS_DB=""
-add_alert() { # sev phase title detail
+add_alert() {
     local sev="$1" ph="$2" title="$3" detail="$4"
     echo "${sev}|${ph}|${title}|${detail//|/;}" >> "$ALERTS_DB"
 }
@@ -545,7 +586,6 @@ passive_recon() {
     fi
     run_jobs_parallel || { pause; return; }
 
-    # basic alert heuristics
     if [ -f "${out}/dig_records.txt" ] && ! grep -qi "v=spf1" "${out}/dig_records.txt" 2>/dev/null; then
         add_alert "Low" "Passive Recon" "No SPF record found" "Domain may be more susceptible to email spoofing. Verify manually."
     fi
@@ -625,7 +665,6 @@ active_recon() {
 
 # ============================================================
 #  DEEP NETWORK SCAN — nmap + masscan + NSE + scapy
-#  (kept sequential: each sub-step has its own y/N policy gate)
 # ============================================================
 deep_scan() {
     require_target || return
@@ -840,12 +879,11 @@ Raven v${VERSION} — recon & assessment orchestrator. By z7.
 Wraps standard, widely-used security tools (whois, dig, subfinder,
 amass, httpx, nmap, nikto, nuclei, tshark, ...) behind one consistent
 menu. It installs nothing itself — see install.sh to fetch the
-underlying tools. Console shows branded phase names, timing, and a
-short "Key Findings" summary; the full command/output detail always
-lives in raven.log and the per-target results/ folder.
+underlying tools.
 
 HOW TO USE
- 1) Option 1: set a target domain (add it to scope.txt first).
+ 1) Option 1: set a target domain (add it to scope.txt first). Target
+    input is validated — only valid hostnames/IPs are accepted.
  2) Option 10: check which underlying tools are installed.
  3) Run phases in order: Passive Recon -> Active Recon -> Deep Scan
     -> Vulnerability Scan. Independent tools inside Passive/Active/
@@ -860,65 +898,19 @@ HOW TO USE
     severity filters, masscan rate, etc. without touching the script.
 
 Press Ctrl+C at any point during a running step to interrupt safely —
-Raven saves whatever partial output exists and returns you to the
-main menu instead of crashing.
+Raven saves whatever partial output exists, then asks if you want to
+set a new target right away instead of just dumping you at the menu.
+
+Pass --no-color to disable ANSI colors, or set NO_COLOR=1.
 
 Only run against targets you are explicitly authorized to test.
 EOF
     pause
 }
 
-show_alert_dashboard() {
-    [ -z "$TARGET_DIR" ] && return
-    local db="${TARGET_DIR}/report/alerts.db"
-    [ -s "$db" ] || return
-    local crit high med low info_c
-    crit=$(grep -c "^Critical|" "$db" 2>/dev/null || echo 0)
-    high=$(grep -c "^High|" "$db" 2>/dev/null || echo 0)
-    med=$(grep -c "^Medium|" "$db" 2>/dev/null || echo 0)
-    low=$(grep -c "^Low|" "$db" 2>/dev/null || echo 0)
-    info_c=$(grep -c "^Info|" "$db" 2>/dev/null || echo 0)
-    echo -e "${C_DIM}Alerts:${C_RESET} ${C_RED}${crit} Crit${C_RESET} ${C_RED}${high} High${C_RESET} ${C_YELLOW}${med} Med${C_RESET} ${C_BLUE}${low} Low${C_RESET} ${C_DIM}${info_c} Info${C_RESET}"
-}
-
-banner() {
-    echo -e "${C_MAGENTA}${C_BOLD}"
-    cat <<'EOF'
-██████╗  █████╗ ██╗   ██╗███████╗███╗   ██╗
-██╔══██╗██╔══██╗██║   ██║██╔════╝████╗  ██║
-██████╔╝███████║██║   ██║█████╗  ██╔██╗ ██║
-██╔══██╗██╔══██║╚██╗ ██╔╝██╔══╝  ██║╚██╗██║
-██║  ██║██║  ██║ ╚████╔╝ ███████╗██║ ╚████║
-╚═╝  ╚═╝╚═╝  ╚═╝  ╚═══╝  ╚══════╝╚═╝  ╚═══╝
-EOF
-    echo -e "${C_RESET}${C_DIM}        recon & assessment orchestrator — v${VERSION} — by z7${C_RESET}"
-    if [ -n "$TARGET" ]; then
-        echo -e "${C_DIM}Current target:${C_RESET} ${C_GREEN}${TARGET}${C_RESET}"
-        show_alert_dashboard
-    fi
-    echo
-}
-
 main_menu() {
     clear; banner
-    cat <<EOF
-┌────────────── MAIN MENU ──────────────┐
-│ 1  Target selection                   │
-│ 2  Passive recon (parallel)           │
-│ 3  Active recon (parallel)            │
-│ 4  Deep network scan                  │
-│ 5  Vulnerability scan (parallel)      │
-│ 6  Packet capture                     │
-│ 7  FULL AUTO (background tmux)        │
-│ 8  Show results                       │
-│ 9  Plugins                            │
-│ 10 Check dependencies                 │
-│ 11 Generate report (HTML+CSV+JSON)    │
-│ 12 Options                            │
-│ 13 About / Help                       │
-│ 14 Exit                               │
-└────────────────────────────────────────┘
-EOF
+    ui_main_menu
     read -rp "Select option: " choice
     case "$choice" in
         1) target_selection ;;  2) passive_recon ;;   3) active_recon ;;
@@ -926,6 +918,8 @@ EOF
         7) full_auto ;;          8) show_results ;;     9) plugins_menu ;;
         10) check_dependencies ;; 11) generate_report ;; 12) options_menu ;;
         13) about_menu ;;        14) echo "Bye."; exit 0 ;;
+        q|Q) echo "Bye."; exit 0 ;;
+        h|H) about_menu ;;
         *) warn "Invalid option."; sleep 1 ;;
     esac
 }
