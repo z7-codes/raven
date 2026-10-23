@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# ============================================================
+#  Example Raven plugin — rename to <name>.sh to enable it.
+#  Plugins receive $TARGET and $TARGET_DIR as environment
+#  variables and run after you pick them from menu option 9.
+# ============================================================
+echo "Example plugin running against target: ${TARGET:-unset}"
+echo "Its results directory is: ${TARGET_DIR:-unset}"
+
+# Your own logic goes here — e.g. call a tool not in Raven's
+# default registry and save the output under $TARGET_DIR:
+#   mkdir -p "$TARGET_DIR/plugins"
+#   mytool "$TARGET" > "$TARGET_DIR/plugins/mytool.txt"

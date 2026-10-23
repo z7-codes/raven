@@ -1,0 +1,6 @@
+# Raven scope file — one authorized domain per line. Copy this to
+# scope.txt and fill in YOUR authorized targets; scope.txt itself is
+# gitignored so your private engagement details never get committed.
+#
+# example.com
+# *.example.com
