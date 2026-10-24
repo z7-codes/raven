@@ -1,5 +1,16 @@
 # Raven
 
+<p align="center">
+  <img src="assets/raven-logo.png" alt="Raven — Reconnaissance Tool" width="360">
+</p>
+
+> Save the project's logo artwork as `assets/raven-logo.png` in your repo
+> for the image above to render on GitHub. The terminal UI can't draw a
+> raster image, so the startup banner instead uses a compact crosshair/
+> reticle glyph in box-drawing characters next to the "RAVEN" wordmark —
+> see it live with `./raven.sh`, or see `docs/banner.txt` for a larger
+> ASCII version suitable for pasting elsewhere.
+
 Recon & assessment orchestrator for authorized security testing.
 Raven wraps standard, widely-used tools (`whois`, `dig`, `subfinder`,
 `amass`, `httpx`, `whatweb`, `nmap`, `masscan`, `nikto`, `nuclei`,
@@ -38,7 +49,7 @@ Raven wraps standard, widely-used tools (`whois`, `dig`, `subfinder`,
 ## Install
 
 ```bash
-git clone https://github.com/z7-codes/raven.git
+git clone https://github.com/<your-username>/raven.git
 cd raven
 sudo ./install.sh
 ```

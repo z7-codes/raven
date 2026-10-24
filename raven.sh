@@ -31,6 +31,7 @@ have()  { command -v "$1" >/dev/null 2>&1; }
 # ============================================================
 MODULE_CONF="${BASE_DIR}/module_names.conf"
 declare -A MODULE_NAME=() MODULE_SLUG=() MODULE_REQUIRED=() MODULE_PHASE=()
+# shellcheck disable=SC2034  # read by lib/ui.sh's ui_refresh_dep_summary, a separate sourced file ShellCheck can't see into
 declare -A TOOLS=()   # tool -> phase label, derived from module_names.conf (kept for lib/ui.sh dep summary)
 
 load_module_names() {
@@ -155,19 +156,34 @@ run_step() {
     log "CMD: $cmd"
     local t0 t1 elapsed
     t0=$(date +%s)
-    eval "$cmd" > "$outfile" 2>>"$LOG_FILE"
+    # BUG FIX: stderr used to go ONLY to the shared raven.log with no
+    # per-module attribution, so a failing module's own result file
+    # gave no clue why. Write stderr to a companion "<file>.err" next
+    # to the module's own output (kept SEPARATE from stdout on purpose
+    # — merging them into the data file risks corrupting the exact
+    # string matches other code greps for, e.g. SPF/severity parsing),
+    # and echo it into raven.log too for a single audit trail.
+    local errfile="${outfile}.err"
+    eval "$cmd" > "$outfile" 2> "$errfile"
     local rc=$?
     t1=$(date +%s)
     elapsed=$((t1 - t0))
     log "EXIT($rc): $cmd (${elapsed}s)"
+    if [ -s "$errfile" ]; then
+        { echo "--- stderr for: $cmd ---"; cat "$errfile"; } >> "$LOG_FILE"
+    else
+        rm -f "$errfile"
+    fi
     if [ "$INTERRUPTED" -eq 1 ]; then
         INTERRUPTED=0
         return 130
     fi
+    [ -n "${TARGET_DIR:-}" ] && { MANIFEST_FILE="${TARGET_DIR}/report/modules.log"; mkdir -p "${TARGET_DIR}/report"
+        manifest_log "${CURRENT_PHASE_LABEL:-Deep Scan}" "$label" "$([ "$rc" -eq 0 ] && echo ok || echo failed)" "${elapsed}s"; }
     if [ $rc -eq 0 ]; then
         ok "$label — done. ($(human_time "$elapsed"))"
     else
-        warn "$label — finished with warnings in $(human_time "$elapsed") (see raven.log)."
+        warn "$label — finished with warnings in $(human_time "$elapsed")$( [ -f "$errfile" ] && echo " — see $(basename "$errfile")" ) (see raven.log)."
     fi
     return $rc
 }
@@ -197,11 +213,25 @@ bar_chars() {
 #     [+] Live Host Probe        00:38
 #     [/] Web Fingerprint        00:12
 #     [x] Subdomain Enumeration  00:05 (warnings)
+MANIFEST_FILE=""
+manifest_log() {
+    # <timestamp>|<phase>|<module>|<status: ok/failed/skipped>|<elapsed>
+    [ -n "$MANIFEST_FILE" ] && echo "$(date '+%Y-%m-%d %H:%M:%S')|$1|$2|$3|$4" >> "$MANIFEST_FILE"
+}
+
 run_jobs_parallel() {
     local phase_label="${1:-Modules}"
     local n="${#JOB_LABELS[@]}"
+    MANIFEST_FILE="${TARGET_DIR}/report/modules.log"
+    mkdir -p "${TARGET_DIR}/report"
+    # Record skips even when there are zero actual jobs to run.
+    if [ -n "${SKIPPED_SUMMARY:-}" ]; then
+        IFS=',' read -ra _skipped <<< "$SKIPPED_SUMMARY"
+        for _s in "${_skipped[@]}"; do manifest_log "$phase_label" "${_s# }" "skipped" "-"; done
+    fi
     [ "$n" -eq 0 ] && return 0
     log "PARALLEL BATCH START ($n jobs) [$phase_label]"
+    local t_phase_start; t_phase_start=$(date +%s)
 
     local tmpdir; tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/raven.XXXXXX")
     local -a tfiles=() pids=() statuses=()
@@ -214,7 +244,12 @@ run_jobs_parallel() {
         statuses+=("running")
         (
             t0=$(date +%s)
-            eval "${JOB_CMDS[$i]}" > "${JOB_OUTS[$i]}" 2>>"$LOG_FILE"
+            # Same reasoning as run_step's fix: per-job .err companion
+            # file instead of all parallel jobs appending to one shared
+            # raven.log at once (which can interleave mid-line) and
+            # instead of merging into the data file (breaks downstream
+            # parsing of that same file).
+            eval "${JOB_CMDS[$i]}" > "${JOB_OUTS[$i]}" 2> "${JOB_OUTS[$i]}.err"
             rc=$?
             t1=$(date +%s)
             echo "$rc $((t1 - t0))" > "$tfile"
@@ -278,13 +313,17 @@ run_jobs_parallel() {
                 if [ "$rc" -eq 0 ]; then
                     printf "\r\e[K  ${C_GREEN}[+]${C_RESET} %-38s %s\n" "${JOB_LABELS[$j]}" "$(human_time "$el")"
                 else
-                    printf "\r\e[K  ${C_RED}[x]${C_RESET} %-38s %s ${C_DIM}(warnings — see raven.log)${C_RESET}\n" \
-                        "${JOB_LABELS[$j]}" "$(human_time "$el")"
+                    printf "\r\e[K  ${C_RED}[x]${C_RESET} %-38s %s ${C_DIM}(warnings — see %s.err)${C_RESET}\n" \
+                        "${JOB_LABELS[$j]}" "$(human_time "$el")" "$(basename "${JOB_OUTS[$j]}")"
                 fi
             fi
         done
     }
 
+    # BUG FIX: ui_hide_cursor/ui_show_cursor existed in lib/ui.sh but
+    # were never actually called, so the real terminal cursor stayed
+    # visible and jumped around during every \e[nA in-place redraw.
+    ui_hide_cursor
     while true; do
         local alive=0
         for pid in "${pids[@]}"; do kill -0 "$pid" 2>/dev/null && alive=1; done
@@ -294,6 +333,7 @@ run_jobs_parallel() {
         sleep 0.2
         [ "$INTERRUPTED" -eq 1 ] && break
     done
+    ui_show_cursor
     echo
     wait 2>/dev/null
     ACTIVE_PIDS=()
@@ -308,7 +348,15 @@ run_jobs_parallel() {
         local rc=0 elapsed=0
         [ -f "${tfiles[$i]}" ] && read -r rc elapsed < "${tfiles[$i]}"
         log "EXIT($rc): ${JOB_LABELS[$i]} (${elapsed}s)"
+        manifest_log "$phase_label" "${JOB_LABELS[$i]}" "$([ "$rc" -eq 0 ] && echo ok || echo failed)" "${elapsed}s"
+        local jerr="${JOB_OUTS[$i]}.err"
+        if [ -s "$jerr" ]; then
+            { echo "--- stderr for: ${JOB_LABELS[$i]} ---"; cat "$jerr"; } >> "$LOG_FILE"
+        else
+            rm -f "$jerr"
+        fi
     done
+    manifest_log "$phase_label" "(phase total)" "duration" "$(( $(date +%s) - t_phase_start ))s"
     [ -n "${SKIPPED_SUMMARY:-}" ] && warn "Skipped (not installed): ${SKIPPED_SUMMARY}"
     SKIPPED_SUMMARY=""
     rm -rf "$tmpdir"
@@ -437,30 +485,49 @@ in_scope() {
     return 1
 }
 
+# BUG FIX: this used to show the numbered scope list but then ignore
+# it completely — you still had to re-type the full domain by hand
+# even when it was entry #2 right there on screen. Now a bare number
+# selects that scope entry directly; anything else is treated as a
+# new domain to validate, add to scope, and select in one step.
 target_selection() {
     clear; banner
     echo -e "${C_BOLD}── Target Selection ──${C_RESET}\n"
+    local -a scope_entries=()
     if [ -s "$SCOPE_FILE" ]; then
-        echo -e "${C_DIM}Current scope entries:${C_RESET}"; nl -ba "$SCOPE_FILE"
+        echo -e "${C_DIM}Current scope entries — enter a number to select one:${C_RESET}"
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            scope_entries+=("$line")
+            printf "  %d) %s\n" "${#scope_entries[@]}" "$line"
+        done < "$SCOPE_FILE"
     else
-        warn "Scope file empty. Add authorized domains first (wildcards like *.example.com allowed)."
+        warn "Scope file empty — type a new domain below to add it (wildcards like *.example.com allowed)."
     fi
     echo
-    read -rp "Add a domain to scope? (blank to skip): " ns
-    if [ -n "$ns" ]; then
-        if is_valid_target "$ns"; then
-            echo "$ns" >> "$SCOPE_FILE"; ok "Added '$ns' to scope."
-        else
-            err "'$ns' doesn't look like a valid domain/IP — not added."
+    read -rp "Number from the list above, or a new domain to add+select: " sel
+
+    local t=""
+    if [[ "$sel" =~ ^[0-9]+$ ]] && [ "$sel" -ge 1 ] && [ "$sel" -le "${#scope_entries[@]}" ]; then
+        t="${scope_entries[$((sel - 1))]}"
+        if [[ "$t" == \** ]]; then
+            err "'$t' is a wildcard scope entry — it authorizes a range, it isn't a scannable host itself. Type a concrete subdomain instead."
+            pause; return
         fi
+    elif [ -n "$sel" ]; then
+        if ! is_valid_target "$sel"; then
+            err "'$sel' doesn't look like a valid domain/IP (letters, digits, dots, hyphens, or a *.domain wildcard). Aborted for safety."
+            pause; return
+        fi
+        if ! grep -qxF "$sel" "$SCOPE_FILE" 2>/dev/null; then
+            echo "$sel" >> "$SCOPE_FILE"
+            ok "Added '$sel' to scope."
+        fi
+        t="$sel"
+    else
+        warn "Nothing entered."; pause; return
     fi
-    echo
-    read -rp "Enter target domain to work on: " t
-    [ -z "$t" ] && { warn "No target entered."; pause; return; }
-    if ! is_valid_target "$t"; then
-        err "'$t' contains characters that aren't valid in a domain/IP (letters, digits, dots, hyphens only). Aborted for safety."
-        pause; return
-    fi
+
     if ! in_scope "$t"; then
         warn "'$t' is NOT listed in scope.txt."
         read -rp "Proceed anyway, only if authorization is verified elsewhere [y/N]: " conf
@@ -528,10 +595,67 @@ check_dependencies() {
 # ============================================================
 #  REPORT ENGINE (ZAP-style alerts: HTML + CSV + JSON)
 # ============================================================
+# sev_sorted <file>: findings in TRUE severity order (Critical first),
+# not alphabetical. `sort -r` on the raw text was showing Medium, Low,
+# High, Critical — the reverse-alphabetical order, not actual risk
+# order, which is the opposite of how a report should read.
+sev_sorted() {
+    awk -F'|' '{
+        if ($1=="Critical") r=1; else if ($1=="High") r=2;
+        else if ($1=="Medium") r=3; else if ($1=="Low") r=4; else r=5;
+        print r "|" $0
+    }' "$1" | sort -t'|' -k1,1n | cut -d'|' -f2-
+}
+
 ALERTS_DB=""
+
+# category_for <raven-phase-label>: coarse grouping used by the report's
+# findings table, independent of which specific module produced it.
+category_for() {
+    case "$1" in
+        "Passive Recon") echo "Reconnaissance" ;;
+        "Active Recon")  echo "Web" ;;
+        "Deep Scan")     echo "Network" ;;
+        "Vulnerability Scan") echo "Web" ;;
+        "Packet Capture") echo "Network" ;;
+        *) echo "General" ;;
+    esac
+}
+
+# recommendation_for <title>: best-effort generic guidance by keyword.
+# Known limitation: these are category-level recommendations, not a
+# per-CVE remediation database — accurate enough to be useful in a
+# report, not a substitute for reading the actual finding detail.
+recommendation_for() {
+    local t="$1"
+    case "$t" in
+        *"zone transfer"*|*"Zone Transfer"*)
+            echo "Restrict AXFR to authorized secondary nameservers only; disable zone transfers to arbitrary clients." ;;
+        *"SPF"*)
+            echo "Publish an SPF record (and consider DKIM/DMARC) to reduce the domain's exposure to email spoofing." ;;
+        *"FTP"*)
+            echo "Disable anonymous FTP if not required; migrate to SFTP/FTPS, or restrict access by IP/firewall." ;;
+        *"Telnet"*)
+            echo "Disable Telnet and migrate to SSH; Telnet transmits credentials and data in cleartext." ;;
+        *"open port"*)
+            echo "Review whether each exposed service needs to be internet-facing; close or firewall anything not required." ;;
+        *"nuclei"*|*"Vulnerability Templates"*)
+            echo "Review the specific template/CVE referenced in the evidence and apply the vendor's patch or mitigation." ;;
+        *"nikto"*|*"Web Server Audit"*)
+            echo "Review the specific web-server misconfiguration noted in the evidence and harden per vendor guidance." ;;
+        *"NSE"*|*"Scripted"*)
+            echo "Review the CVE/script output in the evidence and patch or mitigate the affected service." ;;
+        *) echo "Review the evidence for this finding and remediate per your organization's standard process." ;;
+    esac
+}
+
+# add_alert <severity> <raven-phase> <title> <detail> [asset]
+# Schema: severity|phase|title|detail|asset|category|recommendation
 add_alert() {
-    local sev="$1" ph="$2" title="$3" detail="$4"
-    echo "${sev}|${ph}|${title}|${detail//|/;}" >> "$ALERTS_DB"
+    local sev="$1" ph="$2" title="$3" detail="$4" asset="${5:-$TARGET}"
+    local cat; cat=$(category_for "$ph")
+    local rec; rec=$(recommendation_for "$title")
+    echo "${sev}|${ph}|${title}|${detail//|/;}|${asset}|${cat}|${rec//|/;}" >> "$ALERTS_DB"
 }
 
 init_report() {
@@ -563,10 +687,10 @@ json_escape() {
 export_csv() {
     local out="${TARGET_DIR}/report/alerts.csv"
     {
-        echo "severity,phase,title,detail"
+        echo "severity,phase,title,detail,asset,category,recommendation"
         if [ -s "$ALERTS_DB" ]; then
-            while IFS='|' read -r sev ph title detail; do
-                echo "$(csv_escape "$sev"),$(csv_escape "$ph"),$(csv_escape "$title"),$(csv_escape "$detail")"
+            while IFS='|' read -r sev ph title detail asset cat rec; do
+                echo "$(csv_escape "$sev"),$(csv_escape "$ph"),$(csv_escape "$title"),$(csv_escape "$detail"),$(csv_escape "$asset"),$(csv_escape "$cat"),$(csv_escape "$rec")"
             done < "$ALERTS_DB"
         fi
     } > "$out"
@@ -584,11 +708,12 @@ export_json() {
         echo "  \"alerts\": ["
         if [ "$total" -gt 0 ]; then
             local idx=0
-            while IFS='|' read -r sev ph title detail; do
+            while IFS='|' read -r sev ph title detail asset cat rec; do
                 idx=$((idx+1))
                 local comma=","; [ "$idx" -eq "$total" ] && comma=""
-                printf '    {"severity": "%s", "phase": "%s", "title": "%s", "detail": "%s"}%s\n' \
-                    "$(json_escape "$sev")" "$(json_escape "$ph")" "$(json_escape "$title")" "$(json_escape "$detail")" "$comma"
+                printf '    {"severity": "%s", "phase": "%s", "title": "%s", "detail": "%s", "asset": "%s", "category": "%s", "recommendation": "%s"}%s\n' \
+                    "$(json_escape "$sev")" "$(json_escape "$ph")" "$(json_escape "$title")" "$(json_escape "$detail")" \
+                    "$(json_escape "$asset")" "$(json_escape "$cat")" "$(json_escape "$rec")" "$comma"
             done < "$ALERTS_DB"
         fi
         echo "  ]"
@@ -596,16 +721,52 @@ export_json() {
     } > "$out"
 }
 
+html_escape() {
+    local s="$1"
+    s="${s//&/&amp;}"; s="${s//</&lt;}"; s="${s//>/&gt;}"
+    printf '%s' "$s"
+}
+
+export_markdown() {
+    local out="${TARGET_DIR}/report/raven_report_${TARGET}.md"
+    {
+        echo "# Raven Assessment Report — ${TARGET}"
+        echo "_Generated: $(date) · Raven v${VERSION}_"
+        echo
+        echo "## Findings"
+        if [ -s "$ALERTS_DB" ]; then
+            echo "| Severity | Asset | Category | Finding | Recommendation |"
+            echo "|---|---|---|---|---|"
+            sev_sorted "$ALERTS_DB" | while IFS='|' read -r sev _ title _ asset cat rec; do
+                echo "| ${sev} | ${asset} | ${cat} | ${title} | ${rec} |"
+            done
+        else
+            echo "_No findings recorded yet._"
+        fi
+    } > "$out"
+}
+
 generate_report() {
     require_target || return
     clear; banner
-    phase "Building assessment report for ${TARGET}"
     init_report
+
+    # Cover-page fields. Kept in a small file so they persist across
+    # re-generations instead of being re-asked every single time.
+    local meta_file="${TARGET_DIR}/report/.report_meta"
+    local tester="" org=""
+    [ -f "$meta_file" ] && { tester=$(sed -n '1p' "$meta_file"); org=$(sed -n '2p' "$meta_file"); }
+    echo -e "${C_BOLD}── Report cover details ──${C_RESET} ${C_DIM}(blank keeps the current value)${C_RESET}"
+    read -rp "Tester name [${tester:-none}]: " _t; [ -n "$_t" ] && tester="$_t"
+    read -rp "Organization/client [${org:-none}]: " _o; [ -n "$_o" ] && org="$_o"
+    printf '%s\n%s\n' "$tester" "$org" > "$meta_file"
+
+    phase "Building assessment report for ${TARGET}"
     local html="${TARGET_DIR}/report/raven_report_${TARGET}.html"
     local total=0 crit=0 high=0 med=0 low=0 info_c=0
 
     if [ -s "$ALERTS_DB" ]; then
-        while IFS='|' read -r sev _ _ _; do
+        while IFS='|' read -r sev _ _ _ _ _ _; do
             total=$((total+1))
             case "$sev" in
                 Critical) crit=$((crit+1)) ;;
@@ -617,68 +778,136 @@ generate_report() {
         done < "$ALERTS_DB"
     fi
 
+    local risk="Informational" risk_color="#5bc0de"
+    if [ "$crit" -gt 0 ]; then risk="Critical"; risk_color="#8b0000"
+    elif [ "$high" -gt 0 ]; then risk="High"; risk_color="#d9534f"
+    elif [ "$med" -gt 0 ]; then risk="Medium"; risk_color="#f0ad4e"
+    elif [ "$low" -gt 0 ]; then risk="Low"; risk_color="#5bc0de"
+    fi
+
     {
         cat <<HTML
 <!DOCTYPE html>
 <html><head><meta charset="utf-8">
-<title>Raven Report — ${TARGET}</title>
+<title>Raven Assessment Report — ${TARGET}</title>
 <style>
-body{font-family:Segoe UI,Arial,sans-serif;background:#0f1115;color:#e6e6e6;margin:0;padding:0}
-header{background:#1a1d24;padding:24px 32px;border-bottom:3px solid #6a5acd}
-header h1{margin:0;font-size:22px} header p{margin:4px 0 0;color:#9a9ca3;font-size:13px}
-.container{padding:24px 32px}
-.summary{display:flex;gap:16px;margin-bottom:24px;flex-wrap:wrap}
-.card{background:#1a1d24;border-radius:8px;padding:16px 20px;min-width:110px;text-align:center;border:1px solid #2a2d35}
-.card .num{font-size:28px;font-weight:700} .card .lbl{font-size:12px;color:#9a9ca3;text-transform:uppercase}
-.Critical .num{color:#8b0000} .High .num{color:#d9534f} .Medium .num{color:#f0ad4e}
-.Low .num{color:#5bc0de} .Info .num{color:#9a9ca3}
-table{width:100%;border-collapse:collapse;margin-top:8px}
-th,td{padding:10px 12px;text-align:left;border-bottom:1px solid #2a2d35;font-size:13px}
-th{background:#1a1d24;color:#9a9ca3;text-transform:uppercase;font-size:11px}
-.badge{display:inline-block;padding:3px 10px;border-radius:12px;color:#fff;font-size:11px;font-weight:600}
-.phase-tag{color:#6a5acd;font-weight:600}
-footer{padding:16px 32px;color:#555;font-size:11px}
+:root{--bg:#0b0c10;--panel:#15161c;--border:#262832;--text:#e8e8ec;--muted:#8d8f9a;--accent:#d61f3a;--accent2:#6a2fb0}
+*{box-sizing:border-box}
+body{font-family:"Segoe UI",Arial,sans-serif;background:var(--bg);color:var(--text);margin:0;padding:0}
+.cover{background:linear-gradient(135deg,#1a0a10 0%,#120a1f 60%,#0b0c10 100%);padding:56px 48px 40px;border-bottom:3px solid var(--accent)}
+.cover .brand{font-size:13px;letter-spacing:4px;color:var(--accent);font-weight:700;text-transform:uppercase}
+.cover h1{margin:10px 0 4px;font-size:34px;letter-spacing:1px}
+.cover .sub{color:var(--muted);font-size:13px;margin-bottom:28px}
+.meta-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:18px;max-width:780px}
+.meta-grid div{background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:8px;padding:12px 16px}
+.meta-grid .k{font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--muted)}
+.meta-grid .v{font-size:15px;margin-top:4px;font-weight:600}
+.risk-pill{display:inline-block;margin-top:18px;padding:6px 18px;border-radius:20px;font-weight:700;font-size:13px;color:#fff}
+.container{padding:36px 48px}
+h2{font-size:16px;letter-spacing:1px;text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--border);padding-bottom:10px;margin:36px 0 18px}
+.summary{display:flex;gap:14px;flex-wrap:wrap}
+.card{background:var(--panel);border-radius:10px;padding:18px 22px;min-width:110px;text-align:center;border:1px solid var(--border)}
+.card .num{font-size:30px;font-weight:800} .card .lbl{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-top:4px}
+.Critical .num{color:#ff4d5e} .High .num{color:#ff8a5c} .Medium .num{color:#ffc94d}
+.Low .num{color:#5bc0de} .Info .num{color:var(--muted)}
+table{width:100%;border-collapse:collapse;margin-top:6px;font-size:13px}
+th,td{padding:11px 14px;text-align:left;border-bottom:1px solid var(--border);vertical-align:top}
+th{background:var(--panel);color:var(--muted);text-transform:uppercase;font-size:10px;letter-spacing:.5px}
+tr:hover td{background:rgba(255,255,255,0.02)}
+.badge{display:inline-block;padding:3px 11px;border-radius:12px;color:#fff;font-size:11px;font-weight:700;white-space:nowrap}
+.cat-tag{display:inline-block;padding:2px 9px;border-radius:5px;background:rgba(106,47,176,0.25);color:#c9a8f0;font-size:11px}
+.asset{font-family:monospace;color:#9fd3ff}
+.rec{color:#8fd19e}
+.evidence{font-family:monospace;font-size:11px;color:var(--muted);max-width:280px;overflow-wrap:break-word}
+.appendix-table td,.appendix-table th{font-size:12px}
+.status-ok{color:#5fd68a} .status-failed{color:#ff6b6b} .status-skipped{color:var(--muted)}
+footer{padding:22px 48px;color:#55565f;font-size:11px;border-top:1px solid var(--border);display:flex;justify-content:space-between}
+.empty{color:var(--muted);font-style:italic;padding:16px 0}
 </style></head><body>
-<header>
-  <h1>RAVEN Assessment Report</h1>
-  <p>Target: ${TARGET} &nbsp;|&nbsp; Generated: $(date)</p>
-</header>
+
+<div class="cover">
+  <div class="brand">RAVEN &middot; RECONNAISSANCE TOOL</div>
+  <h1>Security Assessment Report</h1>
+  <div class="sub">Discover / Enumerate / Analyze / Hunt</div>
+  <div class="meta-grid">
+    <div><div class="k">Target</div><div class="v">$(html_escape "$TARGET")</div></div>
+    <div><div class="k">Scan Date</div><div class="v">$(date '+%d %b %Y, %H:%M')</div></div>
+    <div><div class="k">Raven Version</div><div class="v">v${VERSION}</div></div>
+    <div><div class="k">Tester</div><div class="v">$(html_escape "${tester:-—}")</div></div>
+    <div><div class="k">Organization</div><div class="v">$(html_escape "${org:-—}")</div></div>
+  </div>
+  <div class="risk-pill" style="background:${risk_color}">Overall risk: ${risk}</div>
+</div>
+
 <div class="container">
+  <h2>Executive Summary</h2>
   <div class="summary">
-    <div class="card"><div class="num">${total}</div><div class="lbl">Total Alerts</div></div>
+    <div class="card"><div class="num">${total}</div><div class="lbl">Total Findings</div></div>
     <div class="card Critical"><div class="num">${crit}</div><div class="lbl">Critical</div></div>
     <div class="card High"><div class="num">${high}</div><div class="lbl">High</div></div>
     <div class="card Medium"><div class="num">${med}</div><div class="lbl">Medium</div></div>
     <div class="card Low"><div class="num">${low}</div><div class="lbl">Low</div></div>
     <div class="card Info"><div class="num">${info_c}</div><div class="lbl">Info</div></div>
   </div>
-  <table>
-    <tr><th>Severity</th><th>Phase</th><th>Finding</th><th>Detail</th></tr>
+
+  <h2>Findings</h2>
 HTML
         if [ -s "$ALERTS_DB" ]; then
-            sort -t'|' -k1,1 -r "$ALERTS_DB" | \
-            while IFS='|' read -r sev ph title detail; do
+            cat <<'HTML'
+  <table>
+    <tr><th>Severity</th><th>Asset</th><th>Category</th><th>Finding</th><th>Evidence</th><th>Recommendation</th></tr>
+HTML
+            sev_sorted "$ALERTS_DB" | \
+            while IFS='|' read -r sev ph title detail asset cat rec; do
                 color=$(sev_color "$sev")
-                echo "<tr><td><span class=\"badge\" style=\"background:${color}\">${sev}</span></td><td class=\"phase-tag\">${ph}</td><td>${title}</td><td>${detail}</td></tr>"
+                printf '    <tr><td><span class="badge" style="background:%s">%s</span></td><td class="asset">%s</td><td><span class="cat-tag">%s</span></td><td><strong>%s</strong><br><span style="color:var(--muted);font-size:12px">via %s</span></td><td class="evidence">%s</td><td class="rec">%s</td></tr>\n' \
+                    "$color" "$(html_escape "$sev")" "$(html_escape "$asset")" "$(html_escape "$cat")" \
+                    "$(html_escape "$title")" "$(html_escape "$ph")" "$(html_escape "$detail")" "$(html_escape "$rec")"
             done
+            echo "  </table>"
         else
-            echo "<tr><td colspan=4>No alerts recorded yet — run Deep Scan / Vulnerability Scan first.</td></tr>"
+            echo '  <div class="empty">No findings recorded yet — run Deep Scan / Vulnerability Scan first, then regenerate this report.</div>'
         fi
+
+        cat <<'HTML'
+  <h2>Appendix &middot; Modules Run</h2>
+HTML
+        local manifest="${TARGET_DIR}/report/modules.log"
+        if [ -s "$manifest" ]; then
+            echo '  <table class="appendix-table">'
+            echo '    <tr><th>Phase</th><th>Module</th><th>Status</th><th>Duration</th><th>When</th></tr>'
+            while IFS='|' read -r ts ph mod status elapsed; do
+                local cls="status-${status}"
+                printf '    <tr><td>%s</td><td>%s</td><td class="%s">%s</td><td>%s</td><td style="color:var(--muted)">%s</td></tr>\n' \
+                    "$(html_escape "$ph")" "$(html_escape "$mod")" "$cls" "$(html_escape "$status")" "$(html_escape "$elapsed")" "$(html_escape "$ts")"
+            done < "$manifest"
+            echo '  </table>'
+        else
+            echo '  <div class="empty">No module run history yet for this target.</div>'
+        fi
+
         cat <<HTML
-  </table>
 </div>
-<footer>Generated by Raven v${VERSION} — by z7 — for authorized security testing only.</footer>
+<footer>
+  <span>Generated by <strong>Raven</strong> v${VERSION} — for authorized security testing only.</span>
+  <span>by z7</span>
+</footer>
 </body></html>
 HTML
     } > "$html"
 
     export_csv
     export_json
+    export_markdown
 
     ok "Report generated:"
-    find_ "HTML -> ${html}"
-    find_ "CSV  -> ${TARGET_DIR}/report/alerts.csv"
-    find_ "JSON -> ${TARGET_DIR}/report/alerts.json"
+    find_ "HTML     -> ${html}"
+    find_ "CSV      -> ${TARGET_DIR}/report/alerts.csv"
+    find_ "JSON     -> ${TARGET_DIR}/report/alerts.json"
+    find_ "Markdown -> ${TARGET_DIR}/report/raven_report_${TARGET}.md"
+    if have wkhtmltopdf; then
+        info "wkhtmltopdf detected — PDF export is available but not run automatically yet (ask to enable it)."
+    fi
     pause
 }
 
@@ -705,7 +934,12 @@ passive_recon() {
     have whois     && add_job "$(mname whois)"     "whois '$TARGET'" "$f_whois"     || add_skip "$(mname whois)"
     have dig       && add_job "$(mname dig)"       "for r in ${DNS_RECORD_TYPES}; do echo ==\$r==; dig '$TARGET' \$r +noall +answer; done" "$f_dig" || add_skip "$(mname dig)"
     have host      && add_job "$(mname host)"      "host -a '$TARGET'" "$f_host"     || add_skip "$(mname host)"
-    have nslookup  && add_job "$(mname nslookup)"  "nslookup -type=any '$TARGET'" "$f_ns" || add_skip "$(mname nslookup)"
+    # BUG FIX: `-type=any` is deprecated by RFC 8482 and many public
+    # resolvers now refuse it outright, so this job failed with no
+    # usable diagnostic beyond a bare exit code. Query NS and SOA
+    # directly instead (always supported), and don't treat "query
+    # succeeded, target just has no custom records" as a failure.
+    have nslookup  && add_job "$(mname nslookup)"  "echo '== NS =='; nslookup -type=NS '$TARGET'; echo; echo '== SOA =='; nslookup -type=SOA '$TARGET'" "$f_ns" || add_skip "$(mname nslookup)"
     have dnsrecon  && add_job "$(mname dnsrecon)"  "dnsrecon -d '$TARGET' -t std" "$f_dnsrecon" || add_skip "$(mname dnsrecon)"
     have subfinder && add_job "$(mname subfinder)" "subfinder -d '$TARGET' -silent" "$f_sub" || add_skip "$(mname subfinder)"
     have amass     && add_job "$(mname amass)"     "amass enum -passive -d '$TARGET'" "$f_amass" || add_skip "$(mname amass)"
@@ -782,25 +1016,46 @@ active_recon() {
     show_eta "active"
     echo
 
+    # BUG FIX: httpx was only ever probing subdomains.txt (subfinder's
+    # output). The bare target itself (e.g. example.com, not
+    # www.example.com) was NEVER in that list, so if subfinder found
+    # few/no live subdomains, httpx correctly reported 0 — while Web
+    # Fingerprint (whatweb), run separately straight against $TARGET,
+    # succeeded. Key Findings then wrongly read as "target is down"
+    # when it plainly wasn't. Fix: build a combined, de-duplicated
+    # probe list = $TARGET + every discovered subdomain, every time.
+    local probe_list="${out}/.probe-list.tmp"
+    { echo "$TARGET"; [ -f "$sub_list" ] && cat "$sub_list"; } | awk 'NF' | sort -u > "$probe_list"
+
     JOB_LABELS=(); JOB_CMDS=(); JOB_OUTS=(); SKIPPED_SUMMARY=""
-    if have httpx && [ -s "$sub_list" ]; then
-        add_job "$(mname httpx)" "httpx -l '$sub_list' ${HTTPX_OPTS}" "$f_live"
+    if have httpx; then
+        add_job "$(mname httpx)" "httpx -l '$probe_list' ${HTTPX_OPTS}" "$f_live"
     else
         add_skip "$(mname httpx)"
-        warn "$(mname httpx) skipped (run Passive Recon first, and ensure it's installed)."
+        warn "$(mname httpx) skipped (not installed)."
     fi
     have whatweb && add_job "$(mname whatweb)" "whatweb '$TARGET'" "$f_webfp" || add_skip "$(mname whatweb)"
 
     if [ "${#JOB_LABELS[@]}" -gt 0 ]; then
-        run_jobs_parallel "Active Recon" || { pause; return; }
+        run_jobs_parallel "Active Recon" || { rm -f "$probe_list"; pause; return; }
     fi
+    rm -f "$probe_list"
 
     echo
     echo -e "${C_BOLD}Key Findings:${C_RESET}"
-    if [ -f "$f_live" ]; then
-        local live_count
-        live_count=$(wc -l < "$f_live" 2>/dev/null || echo 0)
-        find_ "${live_count} live host(s) responded -> active/$(basename "$f_live")"
+    # RULE: exit code alone is not proof of success — verify the output
+    # file actually has content before reporting a count. httpx exits 0
+    # even when it finds nothing, so an empty file here is reported
+    # honestly as "0 live hosts" rather than silently trusted as such
+    # without having actually looked.
+    if have httpx; then
+        if [ -s "$f_live" ]; then
+            local live_count
+            live_count=$(wc -l < "$f_live" 2>/dev/null)
+            find_ "${live_count} live host(s) responded -> active/$(basename "$f_live")"
+        else
+            find_ "${C_YELLOW}$(mname httpx) produced no output — verify manually (target DNS/connectivity, or a WAF blocking probes)${C_RESET}"
+        fi
     fi
 
     mark_phase_done "active"
@@ -814,6 +1069,7 @@ active_recon() {
 # ============================================================
 deep_scan() {
     require_target || return
+    CURRENT_PHASE_LABEL="Deep Scan"
     clear; banner
     echo -e "${C_BOLD}── Deep Network Scan :: ${TARGET} ──${C_RESET}\n"
     warn "This phase touches the live target directly."
@@ -962,25 +1218,60 @@ vuln_scan() {
 
 pcap_capture() {
     require_target || return
+    CURRENT_PHASE_LABEL="Packet Capture"
     clear; banner
     echo -e "${C_BOLD}── Packet Capture ──${C_RESET}\n"
     warn "Only capture traffic you generate/control — not third-party network sniffing."
-    if have tshark; then
-        read -rp "Interface (e.g. eth0, lo): " iface
-        read -rp "Duration (seconds): " dur
-        if ! [[ "$iface" =~ ^[A-Za-z0-9_.-]{1,32}$ ]]; then
-            err "'$iface' doesn't look like a valid interface name. Aborted for safety."
-            pause; return
-        fi
-        if ! [[ "$dur" =~ ^[0-9]{1,5}$ ]]; then
-            err "Duration must be a plain number of seconds. Aborted for safety."
-            pause; return
-        fi
-        local out="${TARGET_DIR}/pcap/capture_$(date +%s).pcap"
-        run_step "$(mname tshark)" "timeout '$dur' tshark -i '$iface' -w '$out'" "${TARGET_DIR}/pcap/$(mslug tshark)-log.txt"
-        ok "Saved -> $out"
-    else
+    if ! have tshark; then
         warn "$(mname tshark) not installed."
+        pause; return
+    fi
+
+    # BUG FIX (invalid interface silently accepted): the old regex only
+    # checked that the TEXT looked interface-name-shaped ("etho" passes
+    # that check fine) — it never checked the interface actually
+    # exists. Ask tshark itself what it can see (`tshark -D`), which is
+    # more accurate than `ip link show` since it's the exact same
+    # capture-interface list tshark will use.
+    local iface_list; iface_list=$(tshark -D 2>/dev/null | sed -E 's/^[0-9]+\.\s*//; s/\s.*$//')
+    if [ -z "$iface_list" ]; then
+        err "Could not list capture interfaces (try running with sudo/as a user in the 'wireshark' group)."
+        pause; return
+    fi
+    echo "Available interfaces:"
+    echo "$iface_list" | sed 's/^/  - /'
+    echo
+    read -rp "Interface: " iface
+    read -rp "Duration (seconds): " dur
+
+    if ! grep -qxF "$iface" <<< "$iface_list"; then
+        err "'$iface' is not a capture interface tshark can see. Pick one from the list above. Aborted."
+        pause; return
+    fi
+    if ! [[ "$dur" =~ ^[0-9]{1,5}$ ]] || [ "$dur" -eq 0 ]; then
+        err "Duration must be a positive whole number of seconds. Aborted."
+        pause; return
+    fi
+
+    local out="${TARGET_DIR}/pcap/capture_$(date +%s).pcap"
+    local logf="${TARGET_DIR}/pcap/$(mslug tshark)-log.txt"
+    run_step "$(mname tshark)" "timeout '$dur' tshark -i '$iface' -w '$out'" "$logf"
+
+    # BUG FIX (silent "success" with zero packets): exit code 0 from
+    # tshark just means it ran, not that anything was actually
+    # captured (wrong interface with no traffic, insufficient capture
+    # permissions, etc. all look identical from the exit code alone).
+    # Read the packet count back OUT of the file itself before calling
+    # this a success, per the "verify real output" rule.
+    local pkt_count=0
+    if [ -f "$out" ]; then
+        pkt_count=$(tshark -r "$out" 2>/dev/null | wc -l)
+    fi
+    if [ "$pkt_count" -gt 0 ]; then
+        ok "Captured ${pkt_count} packet(s) -> $out"
+    else
+        err "0 packets captured — the file exists but is empty. Common causes: no traffic occurred on '${iface}' during the ${dur}s window, or tshark lacks capture permissions (try: sudo setcap cap_net_raw,cap_net_admin+eip \$(which dumpcap), or run Raven with sudo)."
+        rm -f "$out"
     fi
     pause
 }

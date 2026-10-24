@@ -106,7 +106,20 @@ ui_refresh_dep_summary() {
 #  fits inside 80 columns, falls back to a single line under
 #  UI_NARROW_THRESHOLD cols so it never wraps or gets cut off.
 # ============================================================
+# A literal crow silhouette doesn't hold up at terminal block-character
+# resolution (tried it — reads as a blob, not a bird). The reticle/
+# crosshair ring from the reference art DOES read cleanly in box-drawing
+# characters, so that's what sits to the left of the wordmark, with the
+# red "eye" dot as the one accent color tying back to the source logo.
 ui_wordmark_big() {
+    local crow=(
+        '      │      '
+        '   ╭──┼──╮   '
+        '  ─┤     ├─  '
+        '  ─┤  ●  ├─  '
+        '   ╰──┼──╯   '
+        '      │      '
+    )
     local l1 l2 l3 l4 l5 l6
     l1=' ██████╗  █████╗ ██╗   ██╗███████╗███╗   ██╗'
     l2=' ██╔══██╗██╔══██╗██║   ██║██╔════╝████╗  ██║'
@@ -114,21 +127,38 @@ ui_wordmark_big() {
     l4=' ██╔══██╗██╔══██║╚██╗ ██╔╝██╔══╝  ██║╚██╗██║'
     l5=' ██║  ██║██║  ██║ ╚████╔╝ ███████╗██║ ╚████║'
     l6=' ╚═╝  ╚═╝╚═╝  ╚═╝  ╚═══╝  ╚══════╝╚═╝  ╚═══╝'
+
+    local crow_color eye_color word_colors=()
     if [ "$UI_USE_COLOR" -eq 1 ] && [ "$UI_COLORS" -ge 256 ]; then
-        echo -e "\e[38;5;196m${l1}${C_RESET}"; echo -e "\e[38;5;197m${l2}${C_RESET}"
-        echo -e "\e[38;5;198m${l3}${C_RESET}"; echo -e "\e[38;5;163m${l4}${C_RESET}"
-        echo -e "\e[38;5;128m${l5}${C_RESET}"; echo -e "\e[38;5;93m${l6}${C_RESET}"
+        crow_color="\e[38;5;95m"   # muted dark-red/grey ring
+        eye_color="\e[38;5;196m"   # bright red eye accent
+        word_colors=("\e[38;5;196m" "\e[38;5;197m" "\e[38;5;198m" "\e[38;5;163m" "\e[38;5;128m" "\e[38;5;93m")
     else
-        echo -e "${C_RED}${l1}${C_RESET}"; echo -e "${C_RED}${l2}${C_RESET}"
-        echo -e "${C_MAGENTA}${l3}${C_RESET}"; echo -e "${C_MAGENTA}${l4}${C_RESET}"
-        echo -e "${C_MAGENTA}${l5}${C_RESET}"; echo -e "${C_MAGENTA}${l6}${C_RESET}"
+        crow_color="${C_DIM}"
+        eye_color="${C_RED}"
+        word_colors=("${C_RED}" "${C_RED}" "${C_MAGENTA}" "${C_MAGENTA}" "${C_MAGENTA}" "${C_MAGENTA}")
     fi
+
+    local i wlines=("$l1" "$l2" "$l3" "$l4" "$l5" "$l6")
+    for i in 0 1 2 3 4 5; do
+        local crow_line="${crow[$i]}"
+        if [ "$i" -eq 3 ]; then
+            # Row with the eye: color just the ● glyph in the accent red,
+            # the rest of the ring in the muted color.
+            printf "${crow_color}%s${eye_color}%s${crow_color}%s${C_RESET}  %b${wlines[$i]}${C_RESET}\n" \
+                "  ─┤  " "●" "  ├─  " "${word_colors[$i]}"
+        else
+            printf "${crow_color}%s${C_RESET}  %b${wlines[$i]}${C_RESET}\n" "$crow_line" "${word_colors[$i]}"
+        fi
+    done
 }
 
-# 2-line compact info block (keeps total logo height at 6+2=8 lines).
+# 3-line compact info block: tagline+version, the DISCOVER/ENUMERATE/
+# ANALYZE/HUNT strapline, then target+deps (total logo height 6+3=9).
 ui_stat_block() {
     local tgt="${TARGET:-none selected}"
     echo -e "${C_DIM}v${VERSION} · by z7 · recon & assessment orchestrator${C_RESET}"
+    echo -e "${C_DIM}DISCOVER${C_RESET} / ${C_DIM}ENUMERATE${C_RESET} / ${C_DIM}ANALYZE${C_RESET} / ${C_DIM}HUNT${C_RESET}"
     echo -e "${C_DIM}target:${C_RESET} ${C_GREEN}${tgt}${C_RESET} ${C_DIM}·${C_RESET} ${C_GREEN}${UI_DEP_READY}${C_RESET}${C_DIM}/${C_RESET}${UI_DEP_TOTAL} ${C_DIM}tools ready${C_RESET}"
 }
 
@@ -139,6 +169,7 @@ ui_render_logo() {
         echo -e "${C_DIM}target: ${C_GREEN}${TARGET:-none selected}${C_RESET} ${C_DIM}·${C_RESET} ${UI_DEP_READY}/${UI_DEP_TOTAL} ready"
         return
     fi
+    # (full 9-line logo below: 6-line crow+wordmark + 3-line stat block)
     ui_wordmark_big
     ui_stat_block
 }
